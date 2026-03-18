@@ -1,42 +1,93 @@
-#pragma comment(lib,"ws2_32.lib")
-#include<winsock2.h>
-#include<iostream>
+#include <iostream>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cstring>
+#include <string>
 
-#pragma warning(disable: 4996)
+#include <nlohmann/json.hpp>
 
-int main(int argc,char* argv[]) {
-	
-	WSAData wsaData;
-	WORD DLLVersion = MAKEWORD(2,1);
-	if (WSAStartup(DLLVersion, &wsaData) != 0) {
-		std::cout << "Error #1\n";
-		exit(1);
-	}
-	
-	SOCKADDR_IN addr;
-	int sizeofaddr = sizeof(addr);
-	addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-	addr.sin_port = htons(5000);
-	addr.sin_family = AF_INET;
+using json = nlohmann::json;
 
-	SOCKET sListen = socket(AF_INET,SOCK_STREAM,NULL);
-	bind(sListen, (SOCKADDR*)&addr, sizeof(addr));
-	listen(sListen, SOMAXCONN);
+int main()
+{
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(5000);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	SOCKET newConnection;
-	newConnection = accept(sListen,(SOCKADDR*)&addr,&sizeofaddr);
+    int sListen = socket(AF_INET, SOCK_STREAM, 0);
+    if (sListen < 0) {
+        std::cout << "Socket error\n";
+        return 1;
+    }
 
-	if (newConnection == 0) {
-		std::cout << "Error #2\n";
-	}
-	else
-	{
-		std::cout << "Client connected!\n";
-		char msg[256] = "Hello, it`s my first network program!\n";
-		send(newConnection,msg,sizeof(msg),NULL);
-	}
+    if (bind(sListen, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        std::cout << "Bind error\n";
+        return 1;
+    }
 
-	system("pause");
+    listen(sListen, SOMAXCONN);
 
-	return 0;
+    std::cout << "Waiting for connection...\n";
+
+    sockaddr_in client{};
+    socklen_t clientSize = sizeof(client);
+
+    int newConnection = accept(sListen, (sockaddr*)&client, &clientSize);
+
+    if (newConnection < 0) {
+        std::cout << "Accept error\n";
+    }
+    else {
+        std::cout << "Client connected!\n";
+
+        char buffer[2048]{};
+
+        int bytesReceived = recv(newConnection, buffer, sizeof(buffer), 0);
+
+        if (bytesReceived > 0)
+        {
+            std::string data(buffer, bytesReceived);
+
+            std::cout << "Raw data:\n" << data << std::endl;
+
+            try
+            {
+               
+                json j = json::parse(data);
+
+                std::string type = j.value("type", "");
+
+                if (type == "login")
+                {
+                    std::string email = j.value("email", "");
+                    std::string password = j.value("password", "");
+
+                    std::cout << "\n===== LOGIN DATA =====\n";
+                    std::cout << "Email: " << email << "\n";
+                    std::cout << "Password: " << password << "\n";
+                    std::cout << "======================\n";
+
+                    
+                    json response;
+                    response["type"] = "login_result";
+                    response["status"] = "ok";
+
+                    std::string responseStr = response.dump() + "\n";
+                    send(newConnection, responseStr.c_str(), responseStr.size(), 0);
+                }
+            }
+            catch (const std::exception& e)
+            {
+                std::cout << "JSON parse error: " << e.what() << std::endl;
+            }
+        }
+    }
+
+    close(newConnection);
+    close(sListen);
+
+    return 0;
 }

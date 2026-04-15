@@ -6,7 +6,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <unordered_map>
-#include <errno.h>
+#include <unordered_set>
 
 #include <nlohmann/json.hpp>
 using json = nlohmann::json;
@@ -14,22 +14,55 @@ using json = nlohmann::json;
 #define PORT 5000
 #define MAX_EVENTS 100
 
-
+//--------------------------------------------------
+// Non-blocking socket
+//--------------------------------------------------
 int setNonBlocking(int sock)
 {
     int flags = fcntl(sock, F_GETFL, 0);
     return fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 }
 
+//--------------------------------------------------
+// Global storage
+//--------------------------------------------------
 
+// socket -> buffered data
 std::unordered_map<int, std::string> clientBuffers;
 
+// email -> socket
+std::unordered_map<std::string, int> onlineUsers;
+
+// socket -> email
+std::unordered_map<int, std::string> socketToEmail;
+
+// email -> contacts
+std::unordered_map<std::string,
+    std::unordered_set<std::string>> contacts;
+
+//--------------------------------------------------
+// Safe send JSON
+//--------------------------------------------------
+void sendJson(int fd, const json& j)
+{
+    std::string out = j.dump() + "\n";
+
+    send(fd,
+         out.c_str(),
+         out.size(),
+         0);
+}
+
+//--------------------------------------------------
+// Main
+//--------------------------------------------------
 int main()
 {
     int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (serverSocket < 0)
+
+    if(serverSocket < 0)
     {
-        std::cout << "Socket error\n";
+        std::cerr << "Socket creation failed\n";
         return 1;
     }
 
@@ -38,141 +71,276 @@ int main()
     addr.sin_port = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) < 0)
+    if(bind(serverSocket,
+            (sockaddr*)&addr,
+            sizeof(addr)) < 0)
     {
-        std::cout << "Bind error\n";
+        std::cerr << "Bind failed\n";
         return 1;
     }
 
-    listen(serverSocket, SOMAXCONN);
+    if(listen(serverSocket, SOMAXCONN) < 0)
+    {
+        std::cerr << "Listen failed\n";
+        return 1;
+    }
+
     setNonBlocking(serverSocket);
 
     int epollFd = epoll_create1(0);
 
     epoll_event ev{}, events[MAX_EVENTS];
+
     ev.events = EPOLLIN;
     ev.data.fd = serverSocket;
 
-    epoll_ctl(epollFd, EPOLL_CTL_ADD, serverSocket, &ev);
+    epoll_ctl(epollFd,
+              EPOLL_CTL_ADD,
+              serverSocket,
+              &ev);
 
-    std::cout << "Epoll server started...\n";
+    std::cout << "Server started on port "
+              << PORT << "...\n";
 
-    while (true)
+    //--------------------------------------------------
+    // Event loop
+    //--------------------------------------------------
+    while(true)
     {
-        int eventCount = epoll_wait(epollFd, events, MAX_EVENTS, -1);
+        int eventCount =
+            epoll_wait(epollFd,
+                       events,
+                       MAX_EVENTS,
+                       -1);
 
-        for (int i = 0; i < eventCount; i++)
+        for(int i = 0; i < eventCount; i++)
         {
             int fd = events[i].data.fd;
 
-            
-            if (fd == serverSocket)
+            //--------------------------------------------------
+            // New client
+            //--------------------------------------------------
+            if(fd == serverSocket)
             {
-                while (true)
-                {
-                    sockaddr_in client{};
-                    socklen_t clientSize = sizeof(client);
+                sockaddr_in client{};
+                socklen_t size = sizeof(client);
 
-                    int clientSocket = accept(serverSocket, (sockaddr*)&client, &clientSize);
+                int clientSocket =
+                    accept(serverSocket,
+                           (sockaddr*)&client,
+                           &size);
 
-                    if (clientSocket < 0)
-                    {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK)
-                            break;
-                        else
-                        {
-                            std::cout << "Accept error\n";
-                            break;
-                        }
-                    }
+                if(clientSocket < 0)
+                    continue;
 
-                    setNonBlocking(clientSocket);
+                setNonBlocking(clientSocket);
 
-                    epoll_event clientEv{};
-                    clientEv.events = EPOLLIN;
-                    clientEv.data.fd = clientSocket;
+                epoll_event clientEv{};
+                clientEv.events = EPOLLIN;
+                clientEv.data.fd = clientSocket;
 
-                    epoll_ctl(epollFd, EPOLL_CTL_ADD, clientSocket, &clientEv);
+                epoll_ctl(epollFd,
+                          EPOLL_CTL_ADD,
+                          clientSocket,
+                          &clientEv);
 
-                    clientBuffers[clientSocket] = "";
+                clientBuffers[clientSocket] = "";
 
-                    std::cout << "New client connected\n";
-                }
+                std::cout << "Client connected: "
+                          << clientSocket
+                          << "\n";
             }
+
+            //--------------------------------------------------
+            // Existing client data
+            //--------------------------------------------------
             else
             {
                 char buffer[1024];
 
-                while (true)
-                {
-                    int bytes = recv(fd, buffer, sizeof(buffer), 0);
+                int bytes =
+                    recv(fd,
+                         buffer,
+                         sizeof(buffer),
+                         0);
 
-                    if (bytes > 0)
+                //--------------------------------------------------
+                // Disconnect
+                //--------------------------------------------------
+                if(bytes <= 0)
+                {
+                    if(socketToEmail.count(fd))
                     {
-                        clientBuffers[fd].append(buffer, bytes);
+                        std::string email =
+                            socketToEmail[fd];
+
+                        onlineUsers.erase(email);
+                        socketToEmail.erase(fd);
+
+                        std::cout
+                            << email
+                            << " disconnected\n";
                     }
-                    else if (bytes == 0)
-                    {
-                        std::cout << "Client disconnected\n";
-                        close(fd);
-                        clientBuffers.erase(fd);
-                        break;
-                    }
-                    else
-                    {
-                        if (errno == EAGAIN || errno == EWOULDBLOCK)
-                        {
-                            
-                            break;
-                        }
-                        else
-                        {
-                            std::cout << "Recv error\n";
-                            close(fd);
-                            clientBuffers.erase(fd);
-                            break;
-                        }
-                    }
+
+                    close(fd);
+
+                    clientBuffers.erase(fd);
+
+                    continue;
                 }
 
-                // 🔥 обробка повідомлень
-                std::string &data = clientBuffers[fd];
+                //--------------------------------------------------
+                // Append received data
+                //--------------------------------------------------
+                clientBuffers[fd].append(buffer, bytes);
+
+                std::string &data =
+                    clientBuffers[fd];
 
                 size_t pos;
-                while ((pos = data.find('\n')) != std::string::npos)
+
+                //--------------------------------------------------
+                // Process complete JSON messages
+                //--------------------------------------------------
+                while((pos = data.find('\n'))
+                      != std::string::npos)
                 {
-                    std::string message = data.substr(0, pos);
+                    std::string message =
+                        data.substr(0, pos);
+
                     data.erase(0, pos + 1);
 
-                    std::cout << "\nFull message:\n" << message << std::endl;
+                    if(message.empty())
+                        continue;
 
                     try
                     {
-                        json j = json::parse(message);
+                        json j =
+                            json::parse(message);
 
-                        std::string type = j.value("type", "");
+                        std::string type =
+                            j["type"];
 
-                        if (type == "login")
+                        //--------------------------------------------------
+                        // LOGIN
+                        //--------------------------------------------------
+                        if(type == "login")
                         {
-                            std::string email = j.value("email", "");
-                            std::string password = j.value("password", "");
+                            std::string email =
+                                j["email"];
 
-                            std::cout << "\n===== LOGIN DATA =====\n";
-                            std::cout << "Email: " << email << "\n";
-                            std::cout << "Password: " << password << "\n";
-                            std::cout << "======================\n";
+                            onlineUsers[email] = fd;
+                            socketToEmail[fd] = email;
 
-                            json response;
-                            response["type"] = "login_result";
-                            response["status"] = "ok";
+                            json resp;
+                            resp["type"] =
+                                "login_result";
+                            resp["status"] =
+                                "ok";
 
-                            std::string responseStr = response.dump() + "\n";
-                            send(fd, responseStr.c_str(), responseStr.size(), 0);
+                            sendJson(fd, resp);
+
+                            std::cout
+                                << email
+                                << " logged in\n";
+                        }
+
+                        //--------------------------------------------------
+                        // ADD USER
+                        //--------------------------------------------------
+                        else if(type == "add_user")
+                        {
+                            std::string requester =
+                                socketToEmail[fd];
+
+                            std::string targetEmail =
+                                j["email"];
+
+                            json resp;
+
+                            if(onlineUsers.count(targetEmail))
+                            {
+                                contacts[requester]
+                                    .insert(targetEmail);
+
+                                contacts[targetEmail]
+                                    .insert(requester);
+
+                                //--------------------------------
+                                // Notify requester
+                                //--------------------------------
+                                resp["type"] =
+                                    "add_user_result";
+                                resp["status"] =
+                                    "ok";
+                                resp["email"] =
+                                    targetEmail;
+
+                                sendJson(fd, resp);
+
+                                //--------------------------------
+                                // Notify target
+                                //--------------------------------
+                                json notify;
+                                notify["type"] =
+                                    "add_user_result";
+                                notify["status"] =
+                                    "ok";
+                                notify["email"] =
+                                    requester;
+
+                                int targetFd =
+                                    onlineUsers[targetEmail];
+
+                                sendJson(targetFd,
+                                         notify);
+
+                                std::cout
+                                    << requester
+                                    << " added "
+                                    << targetEmail
+                                    << "\n";
+                            }
+                            else
+                            {
+                                resp["type"] =
+                                    "add_user_result";
+                                resp["status"] =
+                                    "error";
+
+                                sendJson(fd, resp);
+                            }
+                        }
+
+                        //--------------------------------------------------
+                        // CHAT MESSAGE
+                        //--------------------------------------------------
+                        else if(type == "chat_message")
+                        {
+                            std::string to =
+                                j["to"];
+
+                            if(onlineUsers.count(to))
+                            {
+                                int targetFd =
+                                    onlineUsers[to];
+
+                                sendJson(targetFd, j);
+
+                                std::cout
+                                    << j["from"]
+                                    << " -> "
+                                    << to
+                                    << ": "
+                                    << j["text"]
+                                    << "\n";
+                            }
                         }
                     }
-                    catch (const std::exception& e)
+                    catch(...)
                     {
-                        std::cout << "JSON parse error: " << e.what() << std::endl;
+                        std::cerr
+                            << "Invalid JSON received\n";
                     }
                 }
             }
@@ -180,5 +348,6 @@ int main()
     }
 
     close(serverSocket);
+
     return 0;
 }

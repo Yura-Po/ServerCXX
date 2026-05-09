@@ -95,16 +95,20 @@ json loginUser(pqxx::connection& conn,
     pqxx::work txn(conn);
 
     auto r = txn.exec_params(
-        "SELECT password_hash FROM users WHERE LOWER(email)=LOWER($1)",
+        "SELECT password_hash, username "
+        "FROM users "
+        "WHERE LOWER(email)=LOWER($1)",
         email
     );
 
     if(!r.empty() &&
-       verifyPassword(password, r[0]["password_hash"].c_str()))
+       verifyPassword(password,
+                      r[0]["password_hash"].c_str()))
     {
         return {
             {"type","login_result"},
-            {"status","ok"}
+            {"status","ok"},
+            {"username", r[0]["username"].c_str()}
         };
     }
 

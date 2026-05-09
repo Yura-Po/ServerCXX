@@ -16,20 +16,34 @@ pkg_check_modules(ARGON2 REQUIRED libargon2)
 # OpenSSL
 find_package(OpenSSL REQUIRED)
 
+# 🔥 ВСІ ФАЙЛИ СЕРВЕРА
 add_executable(Server
     src/main.cpp
+
     src/auth.cpp
+
+    src/db/db_pool.cpp
+
+    src/services/chat_service.cpp
+
+    src/handlers/message_handler.cpp
 )
 
-# INCLUDE
+# 🔥 INCLUDE ДИРЕКТОРІЇ
 target_include_directories(Server PRIVATE
     ${PQXX_INCLUDE_DIRS}
     ${ARGON2_INCLUDE_DIRS}
     ${OPENSSL_INCLUDE_DIR}
+
     src
+    src/db
+    src/models
+    src/services
+    src/handlers
+    src/utils
 )
 
-# LINK LIBS
+# 🔥 LINK LIBS
 target_link_libraries(Server
     ${PQXX_LIBRARIES}
     ${ARGON2_LIBRARIES}

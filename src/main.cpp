@@ -1,3 +1,4 @@
+
 #include <iostream>
 #include <unistd.h>
 #include <arpa/inet.h>
@@ -47,41 +48,73 @@ void sendJson(Client &client,
         return;
 
     if(clients.find(client.fd) == clients.end())
-    return;
+        return;
 
     std::string out =
         j.dump() + "\n";
 
-    std::cout
-        << "SEND: "
-        << out
-        << std::endl;
+    //--------------------------------
+    // LOG (truncate large payloads)
+    //--------------------------------
+    if(out.size() <= 300)
+        std::cout << "SEND: " << out << std::endl;
+    else
+        std::cout << "SEND: ["
+                  << out.size()
+                  << " bytes]\n";
 
-    int res =
-        SSL_write(
-            client.ssl,
-            out.c_str(),
-            out.size());
+    //--------------------------------
+    // Switch to blocking for reliable
+    // large writes (e.g. file data)
+    //--------------------------------
+    int oldFlags =
+        fcntl(client.fd, F_GETFL, 0);
 
-    if(res <= 0)
+    fcntl(client.fd,
+          F_SETFL,
+          oldFlags & ~O_NONBLOCK);
+
+    //--------------------------------
+    // Write loop (handles partial writes)
+    //--------------------------------
+    const char* ptr = out.c_str();
+    int remaining   = (int)out.size();
+
+    while(remaining > 0)
     {
-        int err =
-            SSL_get_error(
+        int res =
+            SSL_write(
                 client.ssl,
-                res);
+                ptr,
+                remaining);
 
-        if(err == SSL_ERROR_WANT_READ ||
-           err == SSL_ERROR_WANT_WRITE)
+        if(res <= 0)
         {
-            return;
+            int err =
+                SSL_get_error(
+                    client.ssl,
+                    res);
+
+            std::cout
+                << "SSL WRITE ERROR: "
+                << err
+                << std::endl;
+
+            break;
         }
 
-        std::cout
-            << "SSL WRITE ERROR: "
-            << err
-            << std::endl;
+        ptr       += res;
+        remaining -= res;
     }
+
+    //--------------------------------
+    // Restore non-blocking mode
+    //--------------------------------
+    fcntl(client.fd,
+          F_SETFL,
+          oldFlags);
 }
+
 
 //--------------------------------------------------
 void broadcastUserStatus(const std::string& email,
@@ -330,6 +363,12 @@ int main()
                     << "NEW CLIENT: "
                     << clientFd
                     << std::endl;
+
+                // 10-second send timeout so SSL_write never blocks forever
+                struct timeval tv{};
+                tv.tv_sec = 10;
+                setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO,
+                           &tv, sizeof(tv));
 
                 setNonBlocking(clientFd);
 

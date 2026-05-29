@@ -27,6 +27,8 @@ add_executable(Server
     src/services/chat_service.cpp
 
     src/handlers/message_handler.cpp
+
+    src/utils/smtp_sender.cpp
 )
 
 # 🔥 INCLUDE ДИРЕКТОРІЇ

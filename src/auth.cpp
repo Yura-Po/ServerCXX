@@ -1,3 +1,4 @@
+
 #include "auth.h"
 #include <argon2.h>
 #include <algorithm>
@@ -95,7 +96,8 @@ json loginUser(pqxx::connection& conn,
     pqxx::work txn(conn);
 
     auto r = txn.exec_params(
-        "SELECT password_hash, username "
+        "SELECT password_hash, username, "
+        "COALESCE(avatar_url,'') AS avatar_url "
         "FROM users "
         "WHERE LOWER(email)=LOWER($1)",
         email
@@ -106,9 +108,10 @@ json loginUser(pqxx::connection& conn,
                       r[0]["password_hash"].c_str()))
     {
         return {
-            {"type","login_result"},
-            {"status","ok"},
-            {"username", r[0]["username"].c_str()}
+            {"type",       "login_result"},
+            {"status",     "ok"},
+            {"username",   r[0]["username"].c_str()},
+            {"avatar_url", r[0]["avatar_url"].c_str()}
         };
     }
 

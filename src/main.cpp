@@ -1,9 +1,9 @@
-
 #include <iostream>
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/epoll.h>
+#include <poll.h>
 #include <fcntl.h>
 #include <signal.h>
 
@@ -38,6 +38,31 @@ int setNonBlocking(int sock)
 }
 
 //--------------------------------------------------
+// sendJson — надсилає JSON клієнту.
+//
+// Стратегія запису: blocking з коротким SO_SNDTIMEO.
+//
+// Чому не pure non-blocking:
+//   OpenSSL вимагає що якщо SSL_write повернув WANT_WRITE,
+//   наступний виклик МУСИТЬ бути з тим самим ptr і тим самим size.
+//   Якщо ми дропаємо і йдемо далі — SSL стан сокета ламається,
+//   всі наступні SSL_write на цьому fd падають з err=1 (SSL_ERROR_SSL).
+//   Саме це і траплялось: після дропу 4 МБ аватара клієнт відключався.
+//
+// Стратегія:
+//   1. Payload > MAX_SEND_BYTES (700 KB) — відхиляємо одразу, не пишемо.
+//      Аватари такого розміру не повинні потрапляти сюди після
+//      обмеження в uploadUserAvatar (512 KB). Якщо старий великий
+//      аватар все ще є в БД — клієнт отримає порожній рядок замість
+//      даних і має показати заглушку.
+//   2. Малий payload — перемикаємо в blocking з таймаутом 3 с,
+//      пишемо повністю, відновлюємо non-blocking.
+//      3 секунди достатньо для будь-якого JSON чат-повідомлення
+//      навіть на повільному зʼєднанні, і не заморожує epoll loop
+//      надовго при мертвому клієнті.
+//--------------------------------------------------
+static constexpr size_t MAX_SEND_BYTES = 700 * 1024; // 700 KB
+
 void sendJson(Client &client,
               const json& j)
 {
@@ -64,18 +89,54 @@ void sendJson(Client &client,
                   << " bytes]\n";
 
     //--------------------------------
-    // Switch to blocking for reliable
-    // large writes (e.g. file data)
+    // GUARD: відхиляємо занадто великі payload.
+    // Якщо аватар > 700 KB потрапив сюди (старий запис в БД) —
+    // просто не надсилаємо. SSL стан сокета залишається чистим.
+    // Нові аватари обмежені 512 KB в uploadUserAvatar.
     //--------------------------------
-    int oldFlags =
-        fcntl(client.fd, F_GETFL, 0);
-
-    fcntl(client.fd,
-          F_SETFL,
-          oldFlags & ~O_NONBLOCK);
+    if(out.size() > MAX_SEND_BYTES)
+    {
+        std::cout << "SEND REJECTED: payload too large ("
+                  << out.size() << " bytes) fd=" << client.fd << "\n";
+        return;
+    }
 
     //--------------------------------
-    // Write loop (handles partial writes)
+    // Перевіряємо що сокет готовий до запису.
+    // poll() з таймаутом 200 мс — якщо сокет не готовий
+    // (клієнт мертвий або TCP буфер повний) — не чекаємо,
+    // просто виходимо. Epoll loop не блокується.
+    //--------------------------------
+    {
+        struct pollfd pfd{};
+        pfd.fd     = client.fd;
+        pfd.events = POLLOUT;
+        int ready  = poll(&pfd, 1, 200); // 200 мс максимум
+        if(ready <= 0)
+        {
+            // Сокет не готовий або помилка — не пишемо,
+            // epoll сам виявить мертве зʼєднання при наступному read
+            std::cout << "SEND SKIPPED (not writable) fd=" << client.fd << "\n";
+            return;
+        }
+    }
+
+    //--------------------------------
+    // Перемикаємо в blocking з коротким таймаутом.
+    // Після poll() буфер гарантовано має місце,
+    // тому SSL_write поверне результат майже миттєво.
+    // Таймаут 1 с — лише страховка від race condition.
+    //--------------------------------
+    int oldFlags = fcntl(client.fd, F_GETFL, 0);
+    fcntl(client.fd, F_SETFL, oldFlags & ~O_NONBLOCK);
+
+    struct timeval tv{};
+    tv.tv_sec  = 1;
+    tv.tv_usec = 0;
+    setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    //--------------------------------
+    // Write loop
     //--------------------------------
     const char* ptr = out.c_str();
     int remaining   = (int)out.size();
@@ -95,11 +156,9 @@ void sendJson(Client &client,
                     client.ssl,
                     res);
 
-            std::cout
-                << "SSL WRITE ERROR: "
-                << err
-                << std::endl;
-
+            std::cout << "SSL WRITE ERROR fd=" << client.fd
+                      << " err=" << err
+                      << " remaining=" << remaining << std::endl;
             break;
         }
 
@@ -108,11 +167,13 @@ void sendJson(Client &client,
     }
 
     //--------------------------------
-    // Restore non-blocking mode
+    // Відновлюємо non-blocking і скидаємо таймаут
     //--------------------------------
-    fcntl(client.fd,
-          F_SETFL,
-          oldFlags);
+    fcntl(client.fd, F_SETFL, oldFlags);
+
+    tv.tv_sec  = 0;
+    tv.tv_usec = 0;
+    setsockopt(client.fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 
@@ -121,18 +182,24 @@ void broadcastUserStatus(const std::string& email,
                          bool online)
 {
     json j = {
-        {"type", "user_status"},
-        {"email", email},
+        {"type",   "user_status"},
+        {"email",  email},
         {"online", online}
     };
 
-    std::vector<int> deadClients;
+    //--------------------------------
+    // SNAPSHOT fd-ів щоб не ітеруватись
+    // по map під час SSL_write —
+    // помилка запису не повинна
+    // модифікувати clients під час циклу.
+    // Мертві з'єднання epoll виявить сам
+    // при наступному read-евенті.
+    //--------------------------------
+    std::vector<int> targets;
+    targets.reserve(clients.size());
 
-    for(auto &[clientFd, client] : clients)
+    for(auto& [clientFd, client] : clients)
     {
-        //--------------------------------
-        // INVALID CLIENT
-        //--------------------------------
         if(client.fd <= 0 ||
            client.ssl == nullptr ||
            !client.handshakeDone)
@@ -141,7 +208,7 @@ void broadcastUserStatus(const std::string& email,
         }
 
         //--------------------------------
-        // DON'T SEND TO LEAVING USER
+        // НЕ НАДСИЛАЄМО ЮЗЕРУ ЩО ВИХОДИТЬ
         //--------------------------------
         if(!online &&
            socketToEmail.count(clientFd) &&
@@ -150,54 +217,35 @@ void broadcastUserStatus(const std::string& email,
             continue;
         }
 
-        //--------------------------------
-        // SEND
-        //--------------------------------
-        std::string out = j.dump() + "\n";
-
-int res = SSL_write(
-    client.ssl,
-    out.c_str(),
-    out.size()
-);
-
-        if(res <= 0)
-        {
-            int err =
-                SSL_get_error(
-                    client.ssl,
-                    res);
-
-            if(err != SSL_ERROR_WANT_READ &&
-               err != SSL_ERROR_WANT_WRITE)
-            {
-                deadClients.push_back(clientFd);
-            }
-        }
+        targets.push_back(clientFd);
     }
 
-    //--------------------------------
-    // REMOVE DEAD CLIENTS
-    //--------------------------------
-    for(int fd : deadClients)
+    for(int targetFd : targets)
     {
-        closeClient(fd);
+        if(!clients.count(targetFd)) continue;
+        Client& c = clients[targetFd];
+        if(!c.ssl) continue;
+
+        std::cout << "[broadcastUserStatus] sending to fd=" << targetFd << std::endl;
+        sendJson(c, j);
+        std::cout << "[broadcastUserStatus] sent to fd=" << targetFd
+                  << " still_alive=" << (clients.count(targetFd) ? "yes" : "NO!") << std::endl;
     }
 }
 
 //--------------------------------------------------
 void closeClient(int fd)
 {
-    std::cout
-        << "CLIENT CLOSED: "
-        << fd
-        << std::endl;
+    std::cout << "[closeClient] fd=" << fd << std::endl;
 
     //--------------------------------
     // EXISTS?
     //--------------------------------
     if(!clients.count(fd))
-    return;
+    {
+        std::cout << "[closeClient] fd=" << fd << " not in clients, skip\n";
+        return;
+    }
 
     //--------------------------------
     // SAVE EMAIL
@@ -205,66 +253,83 @@ void closeClient(int fd)
     std::string email;
 
     if(socketToEmail.count(fd))
-    {
-        email =
-            socketToEmail[fd];
-    }
+        email = socketToEmail[fd];
+
+    std::cout << "[closeClient] fd=" << fd
+              << " email=" << (email.empty() ? "(none)" : email) << std::endl;
 
     //--------------------------------
-    // SAVE SSL
+    // SAVE SSL (до erase!)
     //--------------------------------
-    SSL* ssl =
-        clients[fd].ssl;
+    SSL* ssl = clients[fd].ssl;
 
     //--------------------------------
-    // REMOVE CLIENT FIRST
+    // 1. ВИДАЛЯЄМО З EPOLL
     //--------------------------------
-    clients.erase(fd);
+    epoll_ctl(
+        epollFd,
+        EPOLL_CTL_DEL,
+        fd,
+        nullptr
+    );
 
     //--------------------------------
-    // REMOVE ONLINE
-    //--------------------------------
-    if(!email.empty())
-    {
-        onlineUsers.erase(email);
-        socketToEmail.erase(fd);
-    }
-
-    //--------------------------------
-    // REMOVE FROM EPOLL
-    //--------------------------------
-   epoll_ctl(
-    epollFd,
-    EPOLL_CTL_DEL,
-    fd,
-    nullptr
-);
-
-    //--------------------------------
-    // BROADCAST
-    //--------------------------------
-    if(!email.empty())
-    {
-        broadcastUserStatus(
-            email,
-            false);
-    }
-
-    //--------------------------------
-    // SSL SHUTDOWN
+    // 2. SSL FREE (без shutdown —
+    // якщо з'єднання вже мертве,
+    // SSL_shutdown генерує зайві помилки)
     //--------------------------------
     if(ssl)
     {
-        SSL_shutdown(ssl);
         SSL_free(ssl);
     }
 
     //--------------------------------
-    // CLOSE SOCKET
+    // 3. ЗАКРИВАЄМО СОКЕТ
     //--------------------------------
-    
     close(fd);
-    fd = -1;
+
+    //--------------------------------
+    // 4. ВИДАЛЯЄМО З clients
+    //--------------------------------
+    clients.erase(fd);
+
+    //--------------------------------
+    // 5. ВИДАЛЯЄМО З onlineUsers/socketToEmail
+    // Перевіряємо що onlineUsers[email]
+    // все ще вказує на ЦЕЙ fd.
+    // Якщо юзер вже перелогінився під новим fd —
+    // не чіпаємо його запис.
+    //--------------------------------
+    if(!email.empty())
+    {
+        if(onlineUsers.count(email) &&
+           onlineUsers[email] == fd)
+        {
+            onlineUsers.erase(email);
+            std::cout << "[closeClient] removed " << email << " from onlineUsers\n";
+        }
+        else if(onlineUsers.count(email))
+        {
+            std::cout << "[closeClient] kept " << email
+                      << " in onlineUsers (now fd=" << onlineUsers[email] << ")\n";
+        }
+
+        socketToEmail.erase(fd);
+    }
+
+    //--------------------------------
+    // 6. BROADCAST "offline"
+    // Викликається ПІСЛЯ того як клієнт
+    // повністю прибраний зі всіх структур.
+    //--------------------------------
+    if(!email.empty())
+    {
+        std::cout << "[closeClient] broadcasting offline for " << email << std::endl;
+        broadcastUserStatus(email, false);
+        std::cout << "[closeClient] broadcast done for " << email << std::endl;
+    }
+
+    std::cout << "[closeClient] done fd=" << fd << std::endl;
 }
 
 //--------------------------------------------------
@@ -282,6 +347,14 @@ int main()
         std::cout << "SSL CTX ERROR\n";
         return 1;
     }
+
+    // Вимикаємо серверний session cache.
+    // SSL_free() під час закриття одного клієнта модифікує спільний
+    // SSL_CTX cache, що може інвалідувати SSL стан інших клієнтів.
+    SSL_CTX_set_session_cache_mode(ssl_ctx, SSL_SESS_CACHE_OFF);
+
+    // Вимикаємо session tickets (TLS 1.3 resumption)
+    SSL_CTX_set_options(ssl_ctx, SSL_OP_NO_TICKET);
 
     SSL_CTX_use_certificate_file(
         ssl_ctx,
@@ -364,12 +437,6 @@ int main()
                     << clientFd
                     << std::endl;
 
-                // 10-second send timeout so SSL_write never blocks forever
-                struct timeval tv{};
-                tv.tv_sec = 10;
-                setsockopt(clientFd, SOL_SOCKET, SO_SNDTIMEO,
-                           &tv, sizeof(tv));
-
                 setNonBlocking(clientFd);
 
                 SSL* ssl =
@@ -401,12 +468,12 @@ int main()
                 if(!clients.count(fd))
                     continue;
 
-               auto it = clients.find(fd);
+                auto it = clients.find(fd);
 
-if(it == clients.end())
-    continue;
+                if(it == clients.end())
+                    continue;
 
-Client* client = &it->second;
+                Client* client = &it->second;
 
                 //--------------------------------
                 // HANDSHAKE
@@ -467,10 +534,15 @@ Client* client = &it->second;
                        err == SSL_ERROR_WANT_WRITE)
                         continue;
 
-                    std::cout
-                        << "SSL READ ERROR: "
-                        << err
-                        << std::endl;
+                    // Детальний лог: err=1 SSL_ERROR_SSL (зіпсований стан протоколу)
+                    //                err=5 SSL_ERROR_SYSCALL (мережева помилка / EOF)
+                    //                err=6 SSL_ERROR_ZERO_RETURN (клієнт надіслав close_notify)
+                    unsigned long sslErr = ERR_get_error();
+                    char errBuf[256] = {};
+                    ERR_error_string_n(sslErr, errBuf, sizeof(errBuf));
+                    std::cout << "SSL READ ERROR fd=" << fd
+                              << " err=" << err
+                              << " detail=" << errBuf << std::endl;
 
                     closeClient(fd);
                     continue;
@@ -482,19 +554,27 @@ Client* client = &it->second;
 
                 //--------------------------------
                 // PARSE
+                // УВАГА: після handleMessage client*
+                // може стати dangling (якщо closeClient
+                // викликався зсередині — kick старої сесії,
+                // erase в map тощо).
+                // Тому перед кожною ітерацією робимо
+                // clients.find(fd) заново.
                 //--------------------------------
-                size_t pos;
-
-                while((pos =
-                       client->buffer.find('\n'))
-                      != std::string::npos)
+                while(true)
                 {
-                    std::string msg =
-                        client->buffer.substr(0, pos);
+                    auto cur = clients.find(fd);
+                    if(cur == clients.end())
+                        break;
 
-                    client->buffer.erase(
-                        0,
-                        pos + 1);
+                    size_t pos = cur->second.buffer.find('\n');
+                    if(pos == std::string::npos)
+                        break;
+
+                    std::string msg =
+                        cur->second.buffer.substr(0, pos);
+
+                    cur->second.buffer.erase(0, pos + 1);
 
                     std::cout
                         << "RAW: "
@@ -503,13 +583,11 @@ Client* client = &it->second;
 
                     try
                     {
-                        json j =
-                            json::parse(msg);
+                        json j = json::parse(msg);
 
-                        handleMessage(
-                            *client,
-                            j,
-                            fd);
+                        // Після handleMessage cur може бути недійсним —
+                        // наступна ітерація знову робить find(fd)
+                        handleMessage(cur->second, j, fd);
                     }
                     catch(...)
                     {

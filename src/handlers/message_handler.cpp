@@ -1,4 +1,3 @@
-
 #include "message_handler.h"
 #include "../services/chat_service.h"
 #include "../db/db_pool.h"
@@ -22,6 +21,9 @@ extern void sendJson(
 extern void broadcastUserStatus(
     const std::string& email,
     bool online);
+
+// FIX: потрібен для кіку старої сесії при повторному логіні
+extern void closeClient(int fd);
 
 using json = nlohmann::json;
 
@@ -108,8 +110,32 @@ void handleMessage(Client& client,
 
         if(result["status"] == "ok")
         {
+            //--------------------------------
+            // KICK OLD SESSION
+            // Якщо цей email вже залогінений
+            // під іншим fd — закриваємо стару
+            // сесію перш ніж реєструвати нову.
+            // Без цього onlineUsers вказував би
+            // на невалідний fd після перелогіну.
+            //--------------------------------
+            if(onlineUsers.count(email))
+            {
+                int oldFd = onlineUsers[email];
+
+                if(oldFd != fd && clients.count(oldFd))
+                {
+                    sendJson(clients[oldFd],
+                    {
+                        {"type",   "kicked"},
+                        {"reason", "logged_in_elsewhere"}
+                    });
+
+                    closeClient(oldFd);
+                }
+            }
+
             onlineUsers[email] = fd;
-            socketToEmail[fd] = email;
+            socketToEmail[fd]  = email;
 
             sendJson(client, result);
 
@@ -118,9 +144,8 @@ void handleMessage(Client& client,
             //--------------------------------
             sendJson(client,
             {
-                {"type","chat_list"},
-                {"chats",
-                 loadUserChats(email)}
+                {"type",  "chat_list"},
+                {"chats", loadUserChats(email)}
             });
 
             //--------------------------------

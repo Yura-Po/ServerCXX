@@ -1,4 +1,3 @@
-
 #pragma once
 #include <pqxx/pqxx>
 #include <memory>

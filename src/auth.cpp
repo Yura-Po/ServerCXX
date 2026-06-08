@@ -1,4 +1,3 @@
-
 #include "auth.h"
 #include <argon2.h>
 #include <algorithm>

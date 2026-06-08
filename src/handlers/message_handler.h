@@ -1,4 +1,3 @@
-
 #pragma once
 #include <nlohmann/json.hpp>
 #include "../models/client.h"

@@ -1,4 +1,3 @@
-
 #include "db_pool.h"
 #include <queue>
 #include <mutex>

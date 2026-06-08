@@ -1,9 +1,9 @@
-
 #include "chat_service.h"
 #include "../db/db_pool.h"
 #include "../utils/utils.h"
 #include "../auth.h"
 
+#include <iostream>
 #include <unordered_map>
 #include <fstream>
 #include <sys/stat.h>
@@ -365,7 +365,36 @@ std::string uploadUserAvatar(const std::string& email,
     mkdir("uploads",         0755);
     mkdir("uploads/avatars", 0755);
 
-    std::string decoded    = base64Decode(b64Data);
+    std::string decoded = base64Decode(b64Data);
+
+    //--------------------------------------------------
+    // FIX: обмеження розміру аватара.
+    //
+    // Раніше сервер приймав аватари будь-якого розміру.
+    // Аватар 4 МБ при відправці через sendJson заморожував
+    // epoll loop на час blocking SSL_write, що призводило
+    // до масового відключення інших клієнтів.
+    //
+    // Тепер:
+    //   - максимум 512 KB після декодування з base64
+    //   - якщо перевищено — повертаємо "" (клієнт отримає
+    //     порожній avatar_url і має показати помилку)
+    //
+    // 512 KB більш ніж достатньо для аватара:
+    //   JPEG 400x400 px при якості 85% ~ 30-80 KB
+    //   PNG  400x400 px                 ~ 100-200 KB
+    //--------------------------------------------------
+    static constexpr size_t MAX_AVATAR_BYTES = 512 * 1024; // 512 KB
+
+    if (decoded.size() > MAX_AVATAR_BYTES)
+    {
+        std::cout << "[uploadUserAvatar] REJECTED: file too large ("
+                  << decoded.size() << " bytes > "
+                  << MAX_AVATAR_BYTES << " limit) for "
+                  << email << "\n";
+        return "";
+    }
+
     std::string storedName = generateUniqueFilename(origName);
     std::string filePath   = "uploads/avatars/" + storedName;
 
